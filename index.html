@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Heart Firework</title>
+
+<!-- =========================
+     PWA / iOS 設定
+     ========================= -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b0b10">
+
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Heart Firework">
+<link rel="apple-touch-icon" href="icon-192.png">
+
+<!-- 一般 favicon（桌機/Android 也會用到） -->
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+
+<style>
+  html, body { margin:0; height:100%; background:#0b0b10; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #hint{
+    position:fixed; left:0; right:0; bottom:14px;
+    text-align:center;
+    font:14px/1.4 system-ui,-apple-system,"Segoe UI";
+    color:rgba(255,255,255,0.72);
+    pointer-events:none; user-select:none;
+    padding: 0 12px;
+  }
+</style>
+</head>
+
+<body>
+<canvas id="c"></canvas>
+<div id="hint"></div>
+
+<script>
+/* =========================
+   Service Worker 註冊：讓 PWA 可離線
+   （GitHub Pages 為 HTTPS，可用）
+   ========================= */
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./service-worker.js").catch(()=>{});
+  });
+}
+
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha:false });
+  const hint = document.getElementById("hint");
+
+  let DPR = 1;
+
+  // ====== 參數 ======
+  const CFG = {
+    // 心形粒子
+    count: 3200,
+    heartScale: 13,
+    beatAmp: 0.08,
+    beatSpeed: 1.8,
+
+    // 匯聚（3 秒）
+    gatherTime: 3.0,
+    attract: 0.0011,
+    swirlStrength: 3.2,
+    swirlDecayExp: 2.4,
+    damping: 0.90,
+
+    // 爆炸（幅度更大）
+    burstPower: 7.5,
+    burstScatter: 2.5,
+
+    // 閃爍
+    sparkleRate: 0.065,
+
+    // 星空視差
+    starCount: 240,
+    starTwinkle: 0.55,
+    parallaxMax: 65,
+
+    bg: "#0b0b10",
+  };
+
+  // ====== resize / retina ======
+  function resize(){
+    DPR = Math.min(2, devicePixelRatio || 1);
+    canvas.width = Math.floor(innerWidth * DPR);
+    canvas.height = Math.floor(innerHeight * DPR);
+    canvas.style.width = innerWidth + "px";
+    canvas.style.height = innerHeight + "px";
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    buildStarfield();
+  }
+  addEventListener("resize", resize);
+
+  // ====== 陀螺儀（主要影響愛心漂移） ======
+  let tiltX = 0, tiltY = 0;
+  let motionEnabled = false;
+
+  function smooth(v,t,a=0.15){ return v + (t-v)*a; }
+
+  function onOrientation(e){
+    const g = e.gamma ?? 0; // 左右
+    const b = e.beta  ?? 0; // 前後
+    tiltX = smooth(tiltX, Math.max(-1, Math.min(1, g / 35)), 0.18);
+    tiltY = smooth(tiltY, Math.max(-1, Math.min(1, b / 35)), 0.18);
+  }
+
+  async function enableMotion(){
+    if (motionEnabled) return;
+
+    const DOE = window.DeviceOrientationEvent;
+    if (DOE && typeof DOE.requestPermission === "function") {
+      // iOS 需要使用者手勢觸發
+      try{
+        const res = await DOE.requestPermission();
+        if (res === "granted") {
+          addEventListener("deviceorientation", onOrientation, true);
+          motionEnabled = true;
+          hint.textContent = "";
+        } else {
+          hint.textContent = "未授權陀螺儀：仍可點擊煙火。";
+        }
+      } catch {
+        hint.textContent = "陀螺儀授權失敗：仍可點擊煙火。";
+      }
+    } else {
+      // Android 多數可直接用
+      addEventListener("deviceorientation", onOrientation, true);
+      motionEnabled = true;
+      hint.textContent = "";
+    }
+  }
+
+  // iOS 提示
+  if (typeof window.DeviceOrientationEvent?.requestPermission === "function"){
+    hint.textContent = "Tap to enable motion（iPhone 需點一下授權陀螺儀）";
+  }
+
+  // ====== 視差星空 ======
+  let stars = [];
+  function buildStarfield(){
+    stars = [];
+    const w = innerWidth, h = innerHeight;
+    const area = w*h;
+    const targetCount = Math.round(CFG.starCount * Math.min(1.35, Math.max(0.75, area/(900*700))));
+    for(let i=0;i<targetCount;i++){
+      const depth = Math.pow(Math.random(), 1.6); // 偏遠星
+      stars.push({ x: Math.random()*w, y: Math.random()*h, depth, seed: Math.random()*1000 });
+    }
+  }
+
+  function drawStarfield(time){
+    const px = tiltX * CFG.parallaxMax;
+    const py = tiltY * CFG.parallaxMax;
+
+    for(const s of stars){
+      const par = 0.15 + s.depth * 0.85;
+      const x = s.x + px * par;
+      const y = s.y + py * par;
+
+      const tw = 0.55 + 0.45 * Math.sin(time*0.9 + s.seed);
+      const alpha = (0.10 + 0.55 * par) * (0.55 + tw*CFG.starTwinkle);
+      const r = 0.45 + par * 1.35;
+
+      ctx.fillStyle = `rgba(255,255,255,${Math.min(1, alpha)})`;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // ====== 心形方程 + 粒子 ======
+  function heart(t){
+    return {
+      x: 16 * Math.sin(t) ** 3,
+      y: 13 * Math.cos(t) - 5*Math.cos(2*t) - 2*Math.cos(3*t) - Math.cos(4*t)
+    };
+  }
+
+  const P = [];
+  function buildHeartParticles(){
+    P.length = 0;
+    for(let i=0;i<CFG.count;i++){
+      const t = Math.random()*Math.PI*2;
+      const h = heart(t);
+      const k = Math.sqrt(Math.random());
+      P.push({
+        bx: h.x*k,
+        by: -h.y*k,
+        x: (Math.random()-0.5)*innerWidth*1.8,
+        y: (Math.random()-0.5)*innerHeight*1.8,
+        vx: 0, vy: 0,
+        seed: Math.random()*1000,
+        hue: 340
+      });
+    }
+  }
+
+  // ====== 狀態機 ======
+  let mode = "gather";
+  let stateStart = performance.now();
+
+  // 愛心中心漂移（有慣性）
+  let centerX = innerWidth/2;
+  let centerY = innerHeight/2;
+
+  function pinkDiamondColor(spark){
+    const hue = 340;
+    const sat = Math.max(0, 100 - spark*90);
+    const light = 56 + spark*32;
+    const alpha = 0.35 + spark*0.65;
+    return { hue, sat, light, alpha };
+  }
+
+  // 點擊：爆炸（同時觸發 iOS 陀螺儀授權）
+  addEventListener("pointerdown", async ()=>{
+    await enableMotion();
+    if (mode === "burst") return;
+
+    mode = "burst";
+    stateStart = performance.now();
+
+    const cx = centerX, cy = centerY;
+    for(const p of P){
+      const dx = p.x - cx;
+      const dy = p.y - cy;
+      const len = Math.hypot(dx,dy) || 1;
+      p.vx = (dx/len + (Math.random()-0.5)*CFG.burstScatter) * CFG.burstPower;
+      p.vy = (dy/len + (Math.random()-0.5)*CFG.burstScatter) * CFG.burstPower;
+      p.hue = Math.random()*360;
+    }
+  });
+
+  // ====== 主迴圈 ======
+  let last = performance.now();
+  function draw(now){
+    const dt = Math.min(0.033, (now-last)/1000);
+    last = now;
+
+    // 背景
+    ctx.fillStyle = CFG.bg;
+    ctx.fillRect(0,0,innerWidth,innerHeight);
+
+    const time = now*0.001;
+
+    // 星空（先畫背景）
+    drawStarfield(time);
+
+    // 目標中心：陀螺儀主要影響漂移
+    const baseCX = innerWidth/2;
+    const baseCY = innerHeight/2;
+    const targetCX = baseCX + tiltX * 80;
+    const targetCY = baseCY + tiltY * 80;
+
+    // 慣性跟隨（漂移手感）
+    centerX += (targetCX - centerX) * 0.08;
+    centerY += (targetCY - centerY) * 0.08;
+
+    // 心跳
+    const beat = 1 + Math.sin(time*CFG.beatSpeed*2*Math.PI)*CFG.beatAmp;
+    const scale = CFG.heartScale * beat;
+
+    // 狀態時間
+    const st = (now - stateStart)/1000;
+
+    // 光暈
+    const glowR = Math.min(innerWidth, innerHeight) * 0.20 * beat;
+    const g = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, glowR);
+    g.addColorStop(0, "rgba(255, 220, 235, 0.12)");
+    g.addColorStop(0.45, "rgba(255, 80, 140, 0.08)");
+    g.addColorStop(1, "rgba(255, 45, 111, 0.00)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, glowR, 0, Math.PI*2);
+    ctx.fill();
+
+    // 更新/繪製粒子
+    for(const p of P){
+      const tx = centerX + p.bx * scale;
+      const ty = centerY + p.by * scale;
+
+      if(mode === "gather"){
+        const dx = tx - p.x;
+        const dy = ty - p.y;
+        const dist = Math.hypot(dx,dy) + 1e-6;
+
+        const nx = -dy/dist;
+        const ny =  dx/dist;
+
+        const swirl = CFG.swirlStrength * Math.exp(-st*CFG.swirlDecayExp);
+
+        p.vx += dx*CFG.attract + nx*swirl*0.03;
+        p.vy += dy*CFG.attract + ny*swirl*0.03;
+
+        p.x += p.vx;
+        p.y += p.vy;
+
+        p.vx *= CFG.damping;
+        p.vy *= CFG.damping;
+
+        p.hue = 340;
+
+        if(st >= CFG.gatherTime){
+          mode = "heart";
+          stateStart = now;
+        }
+      }
+      else if(mode === "heart"){
+        p.x += (tx - p.x) * 0.16;
+        p.y += (ty - p.y) * 0.16;
+        p.hue = 340;
+      }
+      else if(mode === "burst"){
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vx *= 0.90;
+        p.vy *= 0.90;
+
+        if(st > 1.2){
+          mode = "gather";
+          stateStart = now;
+          p.hue = 340;
+        }
+      }
+
+      const spark = Math.random() < CFG.sparkleRate
+        ? 0.70 + Math.random()*0.30
+        : 0.15*Math.abs(Math.sin(time*4 + p.seed));
+
+      const r = 0.75 + spark*2.1;
+
+      let fill;
+      if(mode === "burst"){
+        fill = `hsla(${p.hue},100%,${50+spark*35}%,${0.35+spark*0.65})`;
+      } else {
+        const c = pinkDiamondColor(spark);
+        fill = `hsla(${c.hue},${c.sat}%,${c.light}%,${c.alpha})`;
+      }
+
+      ctx.fillStyle = fill;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  // ====== 啟動 ======
+  function start(){
+    resize();
+    buildHeartParticles();
+    requestAnimationFrame(draw);
+  }
+  start();
+})();
+</script>
+</body>
+</html>
